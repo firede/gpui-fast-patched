@@ -4895,6 +4895,72 @@ impl Window {
     /// [`WrappedLine::paint`](crate::WrappedLine::paint) methods in the [`TextSystem`](crate::TextSystem).
     /// This method is only useful if you need to paint a single glyph that has already been shaped.
     ///
+    /// Paints a glyph rasterized at `raster_font_size`, with its sprite scaled by `scale`
+    /// and placed at `origin` without snapping to the pixel grid or a subpixel variant.
+    ///
+    /// For zooming a canvas the way a compositor scales a layer: the rasterized glyph
+    /// stays in the atlas while the GPU scales it (linear filtering), and the caller
+    /// paints with `paint_glyph` at the new size once the zoom settles.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_scaled(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        raster_font_size: Pixels,
+        scale: f32,
+        color: Hsla,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let element_opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: raster_font_size,
+            subpixel_variant: Default::default(),
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: self.text_system().glyph_dilation_for_color(color),
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if !raster_bounds.is_zero() {
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            let bounds = Bounds {
+                origin: point(
+                    glyph_origin.x + ScaledPixels(raster_bounds.origin.x.0 as f32 * scale),
+                    glyph_origin.y + ScaledPixels(raster_bounds.origin.y.0 as f32 * scale),
+                ),
+                size: size(
+                    ScaledPixels(tile.bounds.size.width.0 as f32 * scale),
+                    ScaledPixels(tile.bounds.size.height.0 as f32 * scale),
+                ),
+            };
+            let content_mask = self.snapped_content_mask();
+            self.next_frame.scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds,
+                content_mask,
+                color: color.opacity(element_opacity),
+                tile,
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        Ok(())
+    }
+
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_glyph(
         &mut self,
