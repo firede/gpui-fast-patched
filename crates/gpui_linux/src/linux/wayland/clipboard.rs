@@ -21,6 +21,48 @@ pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
 /// Text mime types that we'll accept from other programs.
 pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
 
+/// The MIME type that an app names in `GPUI_CLIPBOARD_METADATA_MIME`. The metadata of a `ClipboardString`
+/// is offered under it, so other processes can read it, and read back from offers that have it.
+/// Image entries are offered under their own MIME types.
+pub(crate) fn metadata_mime() -> Option<String> {
+    std::env::var("GPUI_CLIPBOARD_METADATA_MIME").ok().filter(|m| !m.is_empty())
+}
+
+fn first_metadata(item: &ClipboardItem) -> Option<&String> {
+    item.entries().iter().find_map(|e| match e {
+        ClipboardEntry::String(s) => s.metadata.as_ref(),
+        _ => None,
+    })
+}
+
+/// MIME types to offer in addition to text.
+pub(crate) fn extra_mime_types(item: &ClipboardItem) -> Vec<String> {
+    let mut out = Vec::new();
+    if let (Some(m), Some(_)) = (metadata_mime(), first_metadata(item)) {
+        out.push(m);
+    }
+    for e in item.entries() {
+        if let ClipboardEntry::Image(image) = e {
+            out.push(image.format.mime_type().to_string());
+        }
+    }
+    out
+}
+
+fn bytes_for(item: &ClipboardItem, mime_type: &str) -> Option<Vec<u8>> {
+    if metadata_mime().as_deref() == Some(mime_type) {
+        return first_metadata(item).map(|m| m.as_bytes().to_owned());
+    }
+    for e in item.entries() {
+        if let ClipboardEntry::Image(image) = e {
+            if image.format.mime_type() == mime_type {
+                return Some(image.bytes.clone());
+            }
+        }
+    }
+    item.text().map(|t| t.into_bytes())
+}
+
 pub(crate) struct Clipboard {
     connection: Connection,
     loop_handle: LoopHandle<'static, ()>,
@@ -174,19 +216,19 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self.contents.as_ref().and_then(|contents| bytes_for(contents, &mime_type)) {
+            self.send_bytes(fd, bytes);
         }
     }
 
-    pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self
+    pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self
             .primary_contents
             .as_ref()
-            .and_then(|contents| contents.text())
+            .and_then(|contents| bytes_for(contents, &mime_type))
         {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, bytes);
         }
     }
 
@@ -200,9 +242,26 @@ impl Clipboard {
             return self.contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        // Read the metadata MIME type into the string's metadata, and keep both text and image when an offer has both.
+        let mut entries = Vec::new();
+        let text = offer.read_text(&self.connection);
+        let metadata = metadata_mime()
+            .filter(|m| offer.has_mime_type(m))
+            .and_then(|m| offer.read_bytes(&self.connection, &m))
+            .and_then(|b| String::from_utf8(b).ok());
+        if text.is_some() || metadata.is_some() {
+            entries.push(ClipboardEntry::String(gpui::ClipboardString {
+                text: text.and_then(|t| t.text()).unwrap_or_default(),
+                metadata,
+            }));
+        }
+        if let Some(image) = offer.read_image(&self.connection) {
+            entries.extend(image.into_entries());
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        let item = ClipboardItem { entries };
 
         self.cached_read = Some(item.clone());
         Some(item)
