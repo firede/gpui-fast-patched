@@ -1712,16 +1712,25 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
 pub(crate) const BUFFER_COUNT: usize = 3;
 
 pub(crate) mod shader_resources {
+    //! When cross-compiling, build.rs does not precompile the shaders with fxc (it checks `cfg(target_os)` of the
+    //! host running the build script), and the debug fallback `D3DCompileFromFile` reads the sources from their path
+    //! on the build machine. Embed the HLSL sources instead, and compile them from memory at runtime with the
+    //! system's d3dcompiler_47.dll (optimized in release builds).
     use anyhow::Result;
 
-    #[cfg(debug_assertions)]
     use windows::{
         Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
+            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile},
             ID3DBlob,
         },
-        core::{HSTRING, PCSTR},
+        core::PCSTR,
     };
+
+    /// The self-contained shaders.hlsl that build.rs assembles (`fast_rounded_clip_shader::stage`, which checks the
+    /// target OS and also runs when cross-compiling).
+    const SHADERS: &str = include_str!(concat!(env!("OUT_DIR"), "/rounded_clip_shaders.hlsl"));
+    const COLOR_TEXT_RASTER: &str = include_str!("color_text_raster.hlsl");
+    const ALPHA_CORRECTION: &str = include_str!("alpha_correction.hlsl");
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
@@ -1744,89 +1753,39 @@ pub(crate) mod shader_resources {
 
     pub(crate) struct RawShaderBytes<'t> {
         inner: &'t [u8],
-
-        #[cfg(debug_assertions)]
         _blob: ID3DBlob,
     }
 
     impl<'t> RawShaderBytes<'t> {
         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
-            #[cfg(not(debug_assertions))]
-            {
-                Ok(Self::from_bytes(module, target))
-            }
-            #[cfg(debug_assertions)]
-            {
-                let blob = build_shader_blob(module, target)?;
-                let inner = unsafe {
-                    std::slice::from_raw_parts(
-                        blob.GetBufferPointer() as *const u8,
-                        blob.GetBufferSize(),
-                    )
-                };
-                Ok(Self { inner, _blob: blob })
-            }
+            let blob = build_shader_blob(module, target)?;
+            let inner = unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer() as *const u8,
+                    blob.GetBufferSize(),
+                )
+            };
+            Ok(Self { inner, _blob: blob })
         }
 
         pub(crate) fn as_bytes(&'t self) -> &'t [u8] {
             self.inner
         }
-
-        #[cfg(not(debug_assertions))]
-        fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
-            let bytes = match module {
-                ShaderModule::Quad => match target {
-                    ShaderTarget::Vertex => QUAD_VERTEX_BYTES,
-                    ShaderTarget::Fragment => QUAD_FRAGMENT_BYTES,
-                },
-                ShaderModule::Shadow => match target {
-                    ShaderTarget::Vertex => SHADOW_VERTEX_BYTES,
-                    ShaderTarget::Fragment => SHADOW_FRAGMENT_BYTES,
-                },
-                ShaderModule::Underline => match target {
-                    ShaderTarget::Vertex => UNDERLINE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => UNDERLINE_FRAGMENT_BYTES,
-                },
-                ShaderModule::PathRasterization => match target {
-                    ShaderTarget::Vertex => PATH_RASTERIZATION_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_RASTERIZATION_FRAGMENT_BYTES,
-                },
-                ShaderModule::PathSprite => match target {
-                    ShaderTarget::Vertex => PATH_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => PATH_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::MonochromeSprite => match target {
-                    ShaderTarget::Vertex => MONOCHROME_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => MONOCHROME_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::SubpixelSprite => match target {
-                    ShaderTarget::Vertex => SUBPIXEL_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => SUBPIXEL_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::PolychromeSprite => match target {
-                    ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
-                    ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
-                },
-                ShaderModule::EmojiRasterization => match target {
-                    ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
-                    ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
-                },
-            };
-            Self { inner: bytes }
-        }
     }
 
-    #[cfg(debug_assertions)]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
         unsafe {
             use windows::Win32::Graphics::{
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                "color_text_raster.hlsl"
+            let (source, name) = if matches!(entry, ShaderModule::EmojiRasterization) {
+                (
+                    COLOR_TEXT_RASTER.replace("#include \"alpha_correction.hlsl\"", ALPHA_CORRECTION),
+                    "color_text_raster.hlsl\0",
+                )
             } else {
-                "shaders.hlsl"
+                (SHADERS.to_string(), "shaders.hlsl\0")
             };
 
             let entry = format!(
@@ -1841,14 +1800,14 @@ pub(crate) mod shader_resources {
                 ShaderTarget::Vertex => "vs_4_1\0",
                 ShaderTarget::Fragment => "ps_4_1\0",
             };
+            let flags = if cfg!(debug_assertions) {
+                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+            } else {
+                D3DCOMPILE_OPTIMIZATION_LEVEL3
+            };
 
             let mut compile_blob = None;
             let mut error_blob = None;
-            let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(&format!("src/{}", shader_name))
-                .canonicalize()?;
-            let shader_path = crate::fast::rounded_clip::shader_path(shader_path, env!("OUT_DIR"));
-
             let entry_point = PCSTR::from_raw(entry.as_ptr());
             let target_cstr = PCSTR::from_raw(target.as_ptr());
 
@@ -1857,13 +1816,15 @@ pub(crate) mod shader_resources {
                 D3D_COMPILE_STANDARD_FILE_INCLUDE as usize,
             );
 
-            let ret = D3DCompileFromFile(
-                &HSTRING::from(shader_path.to_str().unwrap()),
+            let ret = D3DCompile(
+                source.as_ptr() as *const core::ffi::c_void,
+                source.len(),
+                PCSTR::from_raw(name.as_ptr()),
                 None,
                 include_handler,
                 entry_point,
                 target_cstr,
-                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                flags,
                 0,
                 &mut compile_blob,
                 Some(&mut error_blob),
@@ -1883,10 +1844,6 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(not(debug_assertions))]
-    include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
-
-    #[cfg(debug_assertions)]
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
