@@ -4284,7 +4284,8 @@ impl Window {
         result
     }
 
-    pub(crate) fn with_element_opacity<R>(
+    /// Paint with an extra opacity multiplied into everything painted inside `f` (quads, paths, glyphs, images).
+    pub fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,
         f: impl FnOnce(&mut Self) -> R,
